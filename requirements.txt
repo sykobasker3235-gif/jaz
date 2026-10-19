@@ -1,0 +1,10 @@
+python-telegram-bot>=21.0
+psutil
+flask
+python-dotenv
+requests
+beautifulsoup4
+opencv-python
+Pillow
+user_agent
+fake-useragent
