@@ -1,9 +1,11 @@
 # language: python, file: jax_god.py, target: Railway / VPS / Windows / Linux
 # ULTRA OP — PYTHON-ONLY, BUTTON-DRIVEN
-# No slash commands except /start. All actions on buttons.
-# Features: syntax pre-check, dep auto-install, crash reports, persistent logs,
-#           live stats, RAM cap, scheduled restart, per-user env, git clone,
-#           inline edit, dryrun, runall, audit.
+# v3 fixes:
+#  * Injector injects any of bot_token/BOT_TOKEN/TOKEN, chat_id/USER_ID/... when
+#    used-before-assigned (fixes NameError on child scripts using lowercase).
+#  * Crash-report dedupe — one report per unique signature, then every 3rd, then 5min.
+#  * Auto-stop after 10 identical crashes (kills infinite restart loop).
+#  * Global error handler for handler exceptions; 409-Conflict logs a one-liner.
 
 import ast
 import asyncio
@@ -30,6 +32,7 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, InputFile
 )
+from telegram.error import Conflict
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
@@ -47,6 +50,7 @@ PORT = int(os.getenv("PORT", "8080"))
 MAX_ZIP_BYTES = int(os.getenv("MAX_ZIP_BYTES", str(50 * 1024 * 1024)))
 MAX_RAM_MB_PER_PROCESS = int(os.getenv("MAX_RAM_MB", "2048"))
 DEFAULT_RESTART_INTERVAL = int(os.getenv("RESTART_INTERVAL_SEC", "0"))
+MAX_SAME_CRASH = int(os.getenv("MAX_SAME_CRASH", "10"))
 
 BASE_DIR = Path(__file__).resolve().parent
 WORKSPACES_DIR = BASE_DIR / "workspaces"
@@ -55,6 +59,7 @@ AUDIT_FILE = BASE_DIR / "audit.log"
 WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("JAX_GOD")
 
 ACTIVE_RUNNERS: dict[int, "LiveRunner"] = {}
@@ -70,7 +75,6 @@ MODULE_MAPPER = {
     "jwt": "PyJWT", "websocket": "websocket-client", "requests": "requests"
 }
 
-# All reply-button labels — used to avoid feeding them to a live process
 MENU_BUTTONS = {
     "🛑 Stop", "⚡ Running", "📁 Files", "🖥 Stats",
     "📦 Pip", "🔧 Env", "📥 Clone", "🧹 Clean",
@@ -106,7 +110,7 @@ def is_approved(user_id: int) -> bool:
 def is_banned(user_id: int) -> bool:
     return user_id in db.get("banned", [])
 
-# ==================== PYTHON-ONLY: SYNTAX / DEPS / PRE-EXEC ====================
+# ==================== PYTHON-ONLY: SYNTAX / DEPS ====================
 def scan_imports(path: Path) -> list[str]:
     if path.suffix.lower() != ".py":
         return []
@@ -166,51 +170,86 @@ def _make_preexec(ram_mb: int = 0):
             pass
     return _fn
 
-# ==================== CREDENTIAL INJECTOR (FIXED) ====================
-_TOKEN_LINE_RE = re.compile(r'^[ \t]*(?:BOT_TOKEN|TOKEN|bot_token)[ \t]*=')
-_ID_PURE_INT_RE = re.compile(
-    r'^[ \t]*(USER_ID|CHAT_ID|ADMIN_ID|user_id|admin_id|OWNER_ID|owner_id)'
+# ==================== CREDENTIAL INJECTOR (alias-aware) ====================
+_TOKEN_ALIASES = ("BOT_TOKEN", "TOKEN", "bot_token")
+_ID_ALIASES = (
+    "USER_ID", "CHAT_ID", "ADMIN_ID",
+    "user_id", "chat_id", "admin_id",
+    "OWNER_ID", "owner_id",
+)
+
+_TOKEN_LINE_RE = re.compile(
+    r'^[ \t]*(BOT_TOKEN|TOKEN|bot_token)[ \t]*=(.*)$', re.MULTILINE)
+_ID_PURE_INT_LINE_RE = re.compile(
+    r'^[ \t]*(USER_ID|CHAT_ID|ADMIN_ID|user_id|chat_id|admin_id|OWNER_ID|owner_id)'
     r'[ \t]*=[ \t]*(["\']?)(\d+)\2[ \t]*(?:#.*)?$')
 _TG_TOKEN_RE = re.compile(r'^\d{6,}:[A-Za-z0-9_\-]{30,}$')
-_PLACEHOLDER = {"", "TOKEN", "YOUR_TOKEN", "YOUR_BOT_TOKEN", "TOKEN_HERE",
-                "BOT_TOKEN", "X", "NONE", "NULL", "CHANGE_ME"}
 
-def _extract_rhs(line: str) -> str:
-    try: return line.split("=", 1)[1].strip()
-    except Exception: return ""
+def _is_real_token(rhs: str) -> bool:
+    v = rhs.strip().strip('"').strip("'")
+    return bool(_TG_TOKEN_RE.match(v))
 
-def _is_real_token(val: str) -> bool:
-    return bool(_TG_TOKEN_RE.match(val.strip().strip('"').strip("'")))
+def _get_token_value(text: str) -> str | None:
+    m = _TOKEN_LINE_RE.search(text)
+    if not m: return None
+    v = m.group(2).strip().strip('"').strip("'")
+    return v if _TG_TOKEN_RE.match(v) else None
 
-def inject_credentials(file_path, token: str, user_id: int):
+def _first_use_before_assign(text: str, name: str) -> bool:
+    """True if `name` is referenced AND either never assigned, or its first
+    reference precedes its first assignment."""
+    esc = re.escape(name)
+    assign_re = re.compile(rf'^[ \t]*{esc}\s*(?::[^=\n]+)?=(?!=)', re.MULTILINE)
+    use_re = re.compile(rf'\b{esc}\b')
+    m = assign_re.search(text)
+    if m is None:
+        return use_re.search(text) is not None
+    first_use = use_re.search(text)
+    return first_use is not None and first_use.start() < m.start()
+
+def inject_credentials(file_path, token: str, user_id: int) -> bool:
     try:
         p = Path(file_path)
-        lines = p.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-        token_set = False
-        id_set = False
+        original = p.read_text(encoding="utf-8", errors="replace")
+        lines = original.splitlines(keepends=True)
+
         out = []
         for line in lines:
             body = line.rstrip("\r\n")
             nl = line[len(body):]
-            if _TOKEN_LINE_RE.match(body):
-                current = _extract_rhs(body)
-                if _is_real_token(current):
+
+            m_tok = _TOKEN_LINE_RE.match(body)
+            if m_tok:
+                alias, rhs = m_tok.group(1), m_tok.group(2)
+                if _is_real_token(rhs):
                     out.append(line)
                 else:
-                    out.append(f'BOT_TOKEN = "{token}"{nl or os.linesep}')
-                token_set = True
+                    out.append(f'{alias} = "{token}"{nl or os.linesep}')
                 continue
-            m = _ID_PURE_INT_RE.match(body)
-            if m:
-                out.append(f'{m.group(1)} = {user_id}{nl or os.linesep}')
-                id_set = True
+
+            m_id = _ID_PURE_INT_LINE_RE.match(body)
+            if m_id:
+                out.append(f'{m_id.group(1)} = {user_id}{nl or os.linesep}')
                 continue
+
             out.append(line)
-        prefix = ""
-        if not token_set: prefix += f'BOT_TOKEN = "{token}"\n'
-        if not id_set: prefix += f'USER_ID = {user_id}\n'
-        p.write_text(prefix + "".join(out), encoding="utf-8")
-        logger.info(f"Injection OK on {p.name} (token_set={token_set}, id_set={id_set})")
+
+        joined = "".join(out)
+        tok_val = _get_token_value(joined) or token
+
+        preamble = []
+        for alias in _TOKEN_ALIASES:
+            if _first_use_before_assign(joined, alias):
+                preamble.append(f'{alias} = "{tok_val}"')
+        for alias in _ID_ALIASES:
+            if _first_use_before_assign(joined, alias):
+                preamble.append(f'{alias} = {user_id}')
+
+        final = ("\n".join(preamble) + "\n" if preamble else "") + joined
+        p.write_text(final, encoding="utf-8")
+        logger.info(
+            f"Injection OK on {p.name} (preamble={len(preamble)} alias(es), "
+            f"tok_val={'script' if _get_token_value(joined) else 'engine'})")
         return True
     except Exception as e:
         logger.error(f"Injection failed: {e}")
@@ -296,6 +335,9 @@ class LiveRunner:
         self.restart_count = 0
         self.backoff = 2
         self._last_ram_check = 0
+        self._last_crash_sig = ""
+        self._crash_repeat = 0
+        self._last_crash_report_ts = 0.0
         self.log_dir = workspace / "logs"
         self.log_dir.mkdir(exist_ok=True)
         self.log_path = self.log_dir / f"{script_path.stem}.log"
@@ -309,8 +351,7 @@ class LiveRunner:
         header = (
             f"🚀 <b>LIVE EXECUTION — 24/7 MODE</b>\n"
             f"📄 <b>File:</b> <code>{self.script_path.name}</code>\n"
-            f"♻️ <b>Auto-restart:</b> <code>{'ON' if self.auto_restart else 'OFF'}</code>\n"
-        )
+            f"♻️ <b>Auto-restart:</b> <code>{'ON' if self.auto_restart else 'OFF'}</code>\n")
         if self.max_ram_mb:
             header += f"🧠 <b>RAM cap:</b> <code>{self.max_ram_mb}MB</code>\n"
         if self.restart_interval_sec:
@@ -335,6 +376,17 @@ class LiveRunner:
                     break
                 if exit_code != 0:
                     await self._send_crash_report(context, exit_code)
+
+                if self._crash_repeat >= MAX_SAME_CRASH:
+                    try:
+                        await context.bot.send_message(
+                            self.chat_id,
+                            f"🛑 <b>Stopping — {self._crash_repeat} identical crashes.</b>\n"
+                            f"Fix <code>{html.escape(self.script_path.name)}</code> then start again.",
+                            parse_mode="HTML")
+                    except Exception: pass
+                    break
+
                 if self.restart_interval_sec and run_duration >= self.restart_interval_sec:
                     try:
                         await context.bot.send_message(
@@ -343,11 +395,13 @@ class LiveRunner:
                             parse_mode="HTML")
                     except Exception: pass
                     continue
+
                 if not self.auto_restart or exit_code == 0:
                     break
                 if run_duration > 60:
                     self.backoff = 2
                     self.restart_count = 0
+
                 self.restart_count += 1
                 delay = self.backoff
                 self.backoff = min(self.backoff * 2, 60)
@@ -413,11 +467,11 @@ class LiveRunner:
                     self._last_ram_check = now_t
                     if self.proc and self.proc.returncode is None:
                         try:
-                            p = psutil.Process(self.proc.pid)
-                            rss_mb = p.memory_info().rss / (1024 * 1024)
+                            proc_ = psutil.Process(self.proc.pid)
+                            rss_mb = proc_.memory_info().rss / (1024 * 1024)
                             if rss_mb > self.max_ram_mb:
                                 logger.warning(f"RAM cap exceeded: {rss_mb:.0f}MB > {self.max_ram_mb}MB")
-                                p.kill()
+                                proc_.kill()
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             pass
 
@@ -469,9 +523,27 @@ class LiveRunner:
 
     async def _send_crash_report(self, context: ContextTypes.DEFAULT_TYPE, exit_code: int):
         if not ADMIN_IDS or exit_code == 0: return
-        tail = self.buffer[-3000:] if self.buffer else "(no output)"
+        tail = self.buffer[-3000:] if self.buffer else ""
+        sig = tail[-300:].strip() or "(no output)"
+        now = time.time()
+        if sig == self._last_crash_sig:
+            self._crash_repeat += 1
+        else:
+            self._crash_repeat = 0
+        self._last_crash_sig = sig
+
+        should_send = (
+            self._crash_repeat == 0
+            or self._crash_repeat >= 3
+            or (now - self._last_crash_report_ts) >= 300
+        )
+        if not should_send:
+            return
+        self._last_crash_report_ts = now
+
+        repeat_note = f"\n🔁 <i>identical crash ×{self._crash_repeat}</i>" if self._crash_repeat > 0 else ""
         report = (
-            f"🚨 <b>CRASH REPORT</b>\n"
+            f"🚨 <b>CRASH REPORT</b>{repeat_note}\n"
             f"👤 User: <code>{self.user_id}</code>\n"
             f"📄 Script: <code>{self.script_path.name}</code>\n"
             f"💥 Exit: <code>{exit_code}</code>\n"
@@ -669,7 +741,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Save failed: {e}", reply_markup=main_menu(user_id))
         return
 
-    # 2) Awaiting argument states
+    # 2) Awaiting-argument states
     awaiting = context.user_data.get("awaiting")
     if awaiting:
         context.user_data.pop("awaiting", None)
@@ -908,7 +980,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id if query.message else user_id
     ws = WORKSPACES_DIR / str(user_id)
 
-    # File actions
     if data.startswith("exec_"):
         return await do_exec(query, context, data[len("exec_"):])
 
@@ -945,7 +1016,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("dry_"):
         return await do_dryrun(query, context, data[len("dry_"):])
 
-    # Runner controls
     if data == "proc_kill":
         runner = ACTIVE_RUNNERS.get(chat_id)
         if runner:
@@ -959,6 +1029,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if runner and runner.proc and runner.proc.returncode is None:
             runner.restart_count = 0
             runner.backoff = 2
+            runner._crash_repeat = 0
+            runner._last_crash_sig = ""
             try: runner.proc.terminate()
             except Exception: pass
             await query.answer("♻️ Restarting...", show_alert=False)
@@ -968,7 +1040,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "proc_log":
         await _send_logs(query, context, chat_id, user_id)
 
-    # Tools
     elif data == "tools_logs":
         await _send_logs(query, context, chat_id, user_id)
 
@@ -1020,7 +1091,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"❌ <b>{html.escape(f.name)}</b>: {html.escape(str(e)[:300])}",
                     parse_mode="HTML")
 
-    # Env
     elif data == "env_add":
         context.user_data["awaiting"] = "env_add"
         await query.edit_message_text(
@@ -1031,7 +1101,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_ENV.pop(user_id, None)
         await query.edit_message_text("🧹 Env vars cleared.")
 
-    # Admin
     elif data.startswith("approve_") and user_id in ADMIN_IDS:
         tid = data.split("_")[1]
         db["users"][tid] = {"status": "approved"}; save_db(db)
@@ -1059,7 +1128,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_broadcast"] = True
         await query.edit_message_text("📢 <i>Send the broadcast message now.</i>", parse_mode="HTML")
 
-# ==================== START / BROADCAST ====================
+# ==================== START / BROADCAST / ERROR HANDLER ====================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if is_banned(user.id):
@@ -1099,7 +1168,16 @@ async def bc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(int(uid), f"📢 <b>ADMIN BROADCAST:</b>\n\n{text}", parse_mode="HTML")
             sent += 1
         except Exception: pass
-    await update.message.reply_text(f"✅ Broadcast sent to {sent} users.", reply_markup=main_menu(update.effective_user.id))
+    await update.message.reply_text(
+        f"✅ Broadcast sent to {sent} users.", reply_markup=main_menu(update.effective_user.id))
+
+async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, Conflict):
+        logger.warning("⚠️ Telegram 409 — duplicate poller. "
+                       "Only ONE instance per bot token. Stop extra Railway deployments.")
+        return
+    logger.error(f"Handler error: {type(err).__name__}: {err}")
 
 # ==================== MAIN ====================
 def main():
@@ -1109,13 +1187,13 @@ def main():
     app_.add_handler(CommandHandler("start", start_cmd))
     app_.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Broadcast interceptor for admins (group 1, before generic text_handler)
     app_.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_IDS) & filters.Regex(r'.*'),
                        bc_handler),
         group=1)
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app_.add_handler(CallbackQueryHandler(callback_handler))
+    app_.add_error_handler(global_error_handler)
 
     logger.info("🚀 JAX GOD ENGINE STARTED — BUTTON-DRIVEN ULTRA OP")
     app_.run_polling(drop_pending_updates=True)
